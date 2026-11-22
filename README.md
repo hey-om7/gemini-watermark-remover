@@ -1,9 +1,7 @@
 # ✨ Free Gemini & Google Flow Watermark Remover (Gemini Omni & Nano Banana)
 
 <p align="center">
-  <a href="https://ishara-madu.github.io/gemini-watermark-remover/">
     <img src="./assets/logo.webp" alt="Gemini Watermark Remover Logo" width="100" height="100" />
-  </a>
 </p>
 
 <p align="center">
@@ -12,17 +10,8 @@
 </p>
 
 <p align="center">
-  <a href="https://ishara-madu.github.io/gemini-watermark-remover/"><img src="https://img.shields.io/badge/🚀_Live_Demo-GitHub_Pages-6366f1?style=for-the-badge" alt="Live Demo" /></a>
-  <a href="https://github.com/ishara-madu/gemini-watermark-remover/stargazers"><img src="https://img.shields.io/github/stars/ishara-madu/gemini-watermark-remover?style=for-the-badge&color=eab308" alt="GitHub Stars" /></a>
-  <a href="https://buymeacoffee.com/ishara.madu"><img src="https://img.shields.io/badge/☕_Donate-Buy_Me_A_Coffee-f43f5e?style=for-the-badge" alt="Buy Me A Coffee" /></a>
   <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License" />
 </p>
-
----
-
-## 🌐 Live Website
-
-👉 **Try it online:** [https://ishara-madu.github.io/gemini-watermark-remover/](https://ishara-madu.github.io/gemini-watermark-remover/)
 
 ---
 
@@ -62,10 +51,10 @@ Run the project locally with any static web server:
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/ishara-madu/gemini-watermark-remover.git
+git clone <your-repository-url>
 
 # 2. Navigate to project folder
-cd gemini-watermark-remover
+cd <project-folder>
 
 # 3. Start a local server (using Python 3, Node, or VS Code Live Server)
 # Option A: Python
@@ -82,23 +71,12 @@ Open `http://localhost:8000` in your browser.
 ## 🤝 Contributing
 
 Contributions, issues, and feature requests are welcome!
-Feel free to check the [issues page](https://github.com/ishara-madu/gemini-watermark-remover/issues).
 
 1. Fork the Project
 2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
 3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
 4. Push to the Branch (`git push origin feature/AmazingFeature`)
 5. Open a Pull Request
-
----
-
-## 💖 Support
-
-If you found this tool helpful, consider giving it a ⭐️ star on GitHub or supporting via:
-
-<a href="https://buymeacoffee.com/ishara.madu" target="_blank">
-  <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" width="180" />
-</a>
 
 ---
 

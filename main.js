@@ -1,59 +1,3 @@
-// ── Direct Link Configuration (Monetag) ──
-const MONETAG_DIRECT_LINK = 'https://omg10.com/4/11542046';
-const MONETAG_EXPORT_DIRECT_LINK = 'https://omg10.com/4/11584190';
-
-// Auto-Detect Click Ad (Direct link moved from download button)
-function handleAutoDetectAd() {
-  if (MONETAG_DIRECT_LINK) {
-    try {
-      window.open(MONETAG_DIRECT_LINK, '_blank');
-    } catch (e) {
-      console.error('Failed to open Monetag direct link on auto-detect:', e);
-    }
-  }
-}
-window.handleAutoDetectAd = handleAutoDetectAd;
-
-// Download Ad (Used by Video download)
-function handleDownloadAd() {
-  if (MONETAG_DIRECT_LINK) {
-    try {
-      window.open(MONETAG_DIRECT_LINK, '_blank');
-    } catch (e) {
-      console.error('Failed to open Monetag direct link:', e);
-    }
-  }
-}
-window.handleDownloadAd = handleDownloadAd;
-
-function handleExportAd() {
-  // Open Monetag Export Direct Link
-  if (MONETAG_EXPORT_DIRECT_LINK) {
-    try {
-      window.open(MONETAG_EXPORT_DIRECT_LINK, '_blank');
-    } catch (e) {
-      console.error('Failed to open Monetag export direct link:', e);
-    }
-  }
-}
-window.handleExportAd = handleExportAd;
-
-// ── Monetag OnClick Popunder Tag Loader ──
-let isMonetagLoaded = false;
-function loadMonetagPopunder() {
-  if (isMonetagLoaded) return;
-  isMonetagLoaded = true;
-  try {
-    (function (s) {
-      s.dataset.zone = '11558621';
-      s.src = 'https://al5sm.com/tag.min.js';
-    })([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')));
-  } catch (e) {
-    console.error('Failed to load Monetag popunder script:', e);
-  }
-}
-window.loadMonetagPopunder = loadMonetagPopunder;
-
 // ── 1. Engine Core (alphaMap, blendModes, geometry, tuner) ──
 function calculateAlphaMap(bgCaptureImageData) {
   const { width, height, data } = bgCaptureImageData;
@@ -857,6 +801,181 @@ function detectWatermarkCandidate(imageData, width, height, bgImg) {
   };
 }
 
+// ── Paint-assisted alignment ──
+// Aligns the watermark template to a user-painted mask. Scoring only reads pixels that are
+// inside the painted area (plus a thin margin so the template has some alpha=0 pixels to
+// contrast against). Pixels elsewhere in the image are never read.
+
+function getMaskBounds(mask, width, height) {
+  let x0 = width, y0 = height, x1 = -1, y1 = -1;
+  for (let y = 0; y < height; y++) {
+    const rowOff = y * width;
+    for (let x = 0; x < width; x++) {
+      if (mask[rowOff + x]) {
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+        if (y < y0) y0 = y;
+        if (y > y1) y1 = y;
+      }
+    }
+  }
+  if (x1 < 0) return null;
+  return { x0, y0, x1, y1, w: x1 - x0 + 1, h: y1 - y0 + 1 };
+}
+
+// Square dilation of the mask, limited to a local window. Returns { data, ox, oy, w, h }.
+function dilateMaskLocal(mask, width, height, bounds, d) {
+  const ox = Math.max(0, bounds.x0 - d);
+  const oy = Math.max(0, bounds.y0 - d);
+  const ex = Math.min(width - 1, bounds.x1 + d);
+  const ey = Math.min(height - 1, bounds.y1 + d);
+  const w = ex - ox + 1;
+  const h = ey - oy + 1;
+  const tmp = new Uint8Array(w * h);
+  const out = new Uint8Array(w * h);
+  // Horizontal pass
+  for (let y = 0; y < h; y++) {
+    // Forward-fill from each painted pixel
+    let lastPainted = -Infinity;
+    for (let x = 0; x < w; x++) {
+      if (mask[(oy + y) * width + (ox + x)]) lastPainted = x;
+      if (x - lastPainted <= d) tmp[y * w + x] = 1;
+    }
+    lastPainted = Infinity;
+    for (let x = w - 1; x >= 0; x--) {
+      if (mask[(oy + y) * width + (ox + x)]) lastPainted = x;
+      if (lastPainted - x <= d) tmp[y * w + x] = 1;
+    }
+  }
+  // Vertical pass
+  for (let x = 0; x < w; x++) {
+    let lastPainted = -Infinity;
+    for (let y = 0; y < h; y++) {
+      if (tmp[y * w + x]) lastPainted = y;
+      if (y - lastPainted <= d) out[y * w + x] = 1;
+    }
+    lastPainted = Infinity;
+    for (let y = h - 1; y >= 0; y--) {
+      if (tmp[y * w + x]) lastPainted = y;
+      if (lastPainted - y <= d) out[y * w + x] = 1;
+    }
+  }
+  return { data: out, ox, oy, w, h };
+}
+
+function scoreMaskedCandidate(imageData, width, height, bgImg, region, x, y, size) {
+  if (x < 0 || y < 0 || x + size > width || y + size > height || size < 8) return -1;
+  const { alphas } = getAlphaTemplateData(bgImg, size);
+  const step = Math.max(1, Math.floor(size / 64));
+  const px = imageData.data;
+
+  // Partial correlation: a smooth background trend (plane a + b*u + c*v) is regressed out of
+  // both the pixel luminance L and the template alpha A, then the residuals are correlated.
+  // This stops gradients in the photo (sky, vignette) from outweighing the watermark.
+  let n = 0, su = 0, sv = 0, suu = 0, suv = 0, svv = 0;
+  let sL = 0, suL = 0, svL = 0, sLL = 0;
+  let sA = 0, suA = 0, svA = 0, sAA = 0, sLA = 0, sumLum = 0;
+  for (let r = 0; r < size; r += step) {
+    const iy = y + r;
+    const ry = iy - region.oy;
+    if (ry < 0 || ry >= region.h) continue;
+    const v = r / size - 0.5;
+    for (let c = 0; c < size; c += step) {
+      const ix = x + c;
+      const rx = ix - region.ox;
+      if (rx < 0 || rx >= region.w || !region.data[ry * region.w + rx]) continue;
+      const o = (iy * width + ix) * 4;
+      const L = 0.299 * px[o] + 0.587 * px[o + 1] + 0.114 * px[o + 2];
+      const A = alphas[r * size + c];
+      const u = c / size - 0.5;
+      n++; su += u; sv += v; suu += u * u; suv += u * v; svv += v * v;
+      sL += L; suL += u * L; svL += v * L; sLL += L * L;
+      sA += A; suA += u * A; svA += v * A; sAA += A * A; sLA += L * A;
+      sumLum += L;
+    }
+  }
+  if (n < 30) return -1;
+
+  // Invert the 3x3 normal matrix G = [[n,su,sv],[su,suu,suv],[sv,suv,svv]]
+  const g00 = n, g01 = su, g02 = sv, g11 = suu, g12 = suv, g22 = svv;
+  const det = g00 * (g11 * g22 - g12 * g12) - g01 * (g01 * g22 - g12 * g02) + g02 * (g01 * g12 - g11 * g02);
+  if (Math.abs(det) < 1e-9) return 0;
+  const i00 = (g11 * g22 - g12 * g12) / det;
+  const i01 = (g02 * g12 - g01 * g22) / det;
+  const i02 = (g01 * g12 - g02 * g11) / det;
+  const i11 = (g00 * g22 - g02 * g02) / det;
+  const i12 = (g02 * g01 - g00 * g12) / det;
+  const i22 = (g00 * g11 - g01 * g01) / det;
+  const quad = (a0, a1, a2, b0, b1, b2) =>
+    a0 * (i00 * b0 + i01 * b1 + i02 * b2) +
+    a1 * (i01 * b0 + i11 * b1 + i12 * b2) +
+    a2 * (i02 * b0 + i12 * b1 + i22 * b2);
+
+  const resLL = sLL - quad(sL, suL, svL, sL, suL, svL);
+  const resAA = sAA - quad(sA, suA, svA, sA, suA, svA);
+  const resLA = sLA - quad(sL, suL, svL, sA, suA, svA);
+  if (resAA / n < 0.0001 || resLL / n < 0.5) return 0;
+
+  const nccWhite = resLA / Math.sqrt(resLL * resAA);
+  // Dark polarity (inverted luminance) on bright backgrounds: inversion flips the sign.
+  const nccDark = sumLum / n > 160 ? -nccWhite : 0;
+  return Math.max(nccWhite, nccDark);
+}
+
+function fitWatermarkToMask(imageData, width, height, bgImg, mask) {
+  const bounds = getMaskBounds(mask, width, height);
+  if (!bounds) return null;
+
+  const dim = Math.max(bounds.w, bounds.h);
+  const maxSize = Math.min(width, height) - 1;
+  const margin = Math.max(2, Math.round(dim * 0.08));
+  const region = dilateMaskLocal(mask, width, height, bounds, margin);
+  const cx = (bounds.x0 + bounds.x1) / 2;
+  const cy = (bounds.y0 + bounds.y1) / 2;
+
+  let best = { score: -2, x: 0, y: 0, size: 0 };
+  const sizeFactors = [0.55, 0.7, 0.8, 0.9, 1.0, 1.15, 1.3];
+  for (const f of sizeFactors) {
+    const s = Math.max(16, Math.min(maxSize, Math.round(dim * f)));
+    const range = Math.round(s * 0.35);
+    const step = Math.max(2, Math.round(s / 24));
+    for (let dy = -range; dy <= range; dy += step) {
+      for (let dx = -range; dx <= range; dx += step) {
+        const x = Math.round(cx - s / 2 + dx);
+        const y = Math.round(cy - s / 2 + dy);
+        const score = scoreMaskedCandidate(imageData, width, height, bgImg, region, x, y, s);
+        if (score > best.score) best = { score, x, y, size: s, step };
+      }
+    }
+  }
+  if (best.score < -1) return null;
+
+  // Hill-climb over (x, y, size), halving the step until single-pixel precision.
+  for (let step = Math.max(1, best.step); step >= 1; step = Math.floor(step / 2)) {
+    let improved = true;
+    let guard = 0;
+    while (improved && guard++ < 40) {
+      improved = false;
+      const cur = best;
+      for (const [ddx, ddy, dds] of [
+        [step, 0, 0], [-step, 0, 0], [0, step, 0], [0, -step, 0], [0, 0, step], [0, 0, -step]
+      ]) {
+        const s = Math.max(16, Math.min(maxSize, cur.size + dds));
+        const x = cur.x + ddx;
+        const y = cur.y + ddy;
+        const score = scoreMaskedCandidate(imageData, width, height, bgImg, region, x, y, s);
+        if (score > best.score) {
+          best = { score, x, y, size: s, step };
+          improved = true;
+        }
+      }
+    }
+    if (step === 1) break;
+  }
+
+  return { x: best.x, y: best.y, size: best.size, score: Math.max(0, best.score) };
+}
+
 function detectVideoWatermarkCandidate(imageData, width, height, bgImg) {
   const baseDim = Math.min(width, height);
   const veoBase = {
@@ -1149,6 +1268,14 @@ function initImageRemover() {
   const btnResetSliders = document.getElementById('btn-img-reset-sliders');
   const btnExport = document.getElementById('btn-img-export');
 
+  const btnPaintToggle = document.getElementById('btn-img-paint-toggle');
+  const btnEraser = document.getElementById('btn-img-eraser');
+  const sliderBrush = document.getElementById('slider-img-brush');
+  const lblBrush = document.getElementById('lbl-img-brush');
+  const btnPaintClear = document.getElementById('btn-img-paint-clear');
+  const paintHint = document.getElementById('img-paint-hint');
+  const PAINT_HINT_DEFAULT = paintHint ? paintHint.textContent.trim() : '';
+
   if (!dropzone || !fileInput) return;
 
   let currentFile = null;
@@ -1157,6 +1284,18 @@ function initImageRemover() {
   let currentOriginalBitmap = null;
   let currentDetected = null;
   let isProcessing = false;
+
+  // Paint state. The mask has one byte per image pixel; the overlay is only for display.
+  let paintMask = null;
+  let paintOverlay = null;
+  let paintActive = false;
+  let eraseMode = false;
+  let hasPaint = false;
+  let brushSize = 12;
+  let lastRoi = null;
+  let renderQueued = false;
+  let strokeLast = null;
+  let strokeSource = null;
 
   const currentSettings = { gain: 0.6, offsetX: -128, offsetY: -128, sizeScale: 1 };
 
@@ -1350,6 +1489,232 @@ function initImageRemover() {
     });
   }
 
+  // ── Paint tool ──
+  // The paint only helps locate the logo. Removal always uses the normal settings.
+  function getCleanOptions() {
+    return currentSettings;
+  }
+
+  function setPaintHint(text) {
+    if (paintHint) paintHint.textContent = text || PAINT_HINT_DEFAULT;
+  }
+
+  function scheduleRender() {
+    if (renderQueued) return;
+    renderQueued = true;
+    requestAnimationFrame(() => {
+      renderQueued = false;
+      renderTuner();
+    });
+  }
+
+  function ensurePaintLayers() {
+    if (!currentPreviewFrame) return false;
+    const { width, height } = currentPreviewFrame;
+    if (!paintMask || paintMask.length !== width * height) {
+      paintMask = new Uint8Array(width * height);
+      paintOverlay = document.createElement('canvas');
+      paintOverlay.width = width;
+      paintOverlay.height = height;
+    }
+    return true;
+  }
+
+  function updateBrushLimits() {
+    if (!sliderBrush || !currentBase) return;
+    const max = Math.max(20, currentBase.size);
+    sliderBrush.max = max;
+    brushSize = Math.max(2, Math.min(max, Math.round(currentBase.size * 0.15)));
+    sliderBrush.value = brushSize;
+    if (lblBrush) lblBrush.textContent = `${brushSize}px`;
+  }
+
+  function refreshPaintUi() {
+    btnPaintToggle?.classList.toggle('active', paintActive && !eraseMode);
+    btnEraser?.classList.toggle('active', paintActive && eraseMode);
+    [mainCanvas, zoomCanvas].forEach(c => c?.classList.toggle('paint-cursor', paintActive));
+  }
+
+  function resetPaint() {
+    paintMask = null;
+    paintOverlay = null;
+    hasPaint = false;
+    paintActive = false;
+    eraseMode = false;
+    strokeLast = null;
+    strokeSource = null;
+    setPaintHint();
+    refreshPaintUi();
+    updateBrushLimits();
+  }
+
+  function recomputeHasPaint() {
+    hasPaint = false;
+    if (!paintMask) return;
+    for (let i = 0; i < paintMask.length; i++) {
+      if (paintMask[i]) { hasPaint = true; break; }
+    }
+  }
+
+  function stamp(x, y) {
+    const { width, height } = currentPreviewFrame;
+    const r = brushSize / 2;
+    const x0 = Math.max(0, Math.floor(x - r));
+    const x1 = Math.min(width - 1, Math.ceil(x + r));
+    const y0 = Math.max(0, Math.floor(y - r));
+    const y1 = Math.min(height - 1, Math.ceil(y + r));
+    const r2 = r * r;
+    const value = eraseMode ? 0 : 1;
+    for (let py = y0; py <= y1; py++) {
+      const dy = py + 0.5 - y;
+      for (let px = x0; px <= x1; px++) {
+        const dx = px + 0.5 - x;
+        if (dx * dx + dy * dy <= r2) paintMask[py * width + px] = value;
+      }
+    }
+    const octx = paintOverlay.getContext('2d');
+    octx.globalCompositeOperation = eraseMode ? 'destination-out' : 'source-over';
+    octx.fillStyle = 'rgb(239, 68, 68)';
+    octx.beginPath();
+    octx.arc(x, y, r, 0, Math.PI * 2);
+    octx.fill();
+    if (!eraseMode) hasPaint = true;
+  }
+
+  function strokeTo(x, y) {
+    if (!strokeLast) {
+      stamp(x, y);
+    } else {
+      const dx = x - strokeLast.x;
+      const dy = y - strokeLast.y;
+      const dist = Math.hypot(dx, dy);
+      const spacing = Math.max(1, brushSize / 4);
+      const steps = Math.max(1, Math.ceil(dist / spacing));
+      for (let i = 1; i <= steps; i++) {
+        stamp(strokeLast.x + (dx * i) / steps, strokeLast.y + (dy * i) / steps);
+      }
+    }
+    strokeLast = { x, y };
+  }
+
+  function eventToImagePoint(e, canvas, source) {
+    const rect = canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    const cx = ((e.clientX - rect.left) * canvas.width) / rect.width;
+    const cy = ((e.clientY - rect.top) * canvas.height) / rect.height;
+    if (source === 'zoom') {
+      if (!lastRoi) return null;
+      return {
+        x: lastRoi.x + (cx * lastRoi.width) / canvas.width,
+        y: lastRoi.y + (cy * lastRoi.height) / canvas.height
+      };
+    }
+    const scale = canvas.width / currentPreviewFrame.width;
+    return { x: cx / scale, y: cy / scale };
+  }
+
+  function bindPaintCanvas(canvas, source) {
+    if (!canvas) return;
+    canvas.addEventListener('pointerdown', (e) => {
+      if (!paintActive || !currentPreviewFrame || !ensurePaintLayers()) return;
+      const pt = eventToImagePoint(e, canvas, source);
+      if (!pt) return;
+      e.preventDefault();
+      canvas.setPointerCapture?.(e.pointerId);
+      strokeSource = source;
+      strokeLast = null;
+      strokeTo(pt.x, pt.y);
+      scheduleRender();
+    });
+    canvas.addEventListener('pointermove', (e) => {
+      if (strokeSource !== source) return;
+      const pt = eventToImagePoint(e, canvas, source);
+      if (!pt) return;
+      strokeTo(pt.x, pt.y);
+      scheduleRender();
+    });
+    const endStroke = (e) => {
+      if (strokeSource !== source) return;
+      strokeSource = null;
+      strokeLast = null;
+      canvas.releasePointerCapture?.(e.pointerId);
+      recomputeHasPaint();
+      if (!eraseMode || hasPaint) fitToPaint();
+      else scheduleRender();
+    };
+    canvas.addEventListener('pointerup', endStroke);
+    canvas.addEventListener('pointercancel', endStroke);
+  }
+
+  bindPaintCanvas(mainCanvas, 'main');
+  bindPaintCanvas(zoomCanvas, 'zoom');
+
+  btnPaintToggle?.addEventListener('click', () => {
+    if (paintActive && !eraseMode) {
+      paintActive = false;
+    } else {
+      paintActive = true;
+      eraseMode = false;
+    }
+    refreshPaintUi();
+    renderTuner();
+  });
+
+  btnEraser?.addEventListener('click', () => {
+    if (paintActive && eraseMode) {
+      paintActive = false;
+    } else {
+      paintActive = true;
+      eraseMode = true;
+    }
+    refreshPaintUi();
+    renderTuner();
+  });
+
+  sliderBrush?.addEventListener('input', (e) => {
+    brushSize = parseInt(e.target.value, 10);
+    if (lblBrush) lblBrush.textContent = `${brushSize}px`;
+  });
+
+  btnPaintClear?.addEventListener('click', () => {
+    if (paintMask) paintMask.fill(0);
+    if (paintOverlay) paintOverlay.getContext('2d').clearRect(0, 0, paintOverlay.width, paintOverlay.height);
+    hasPaint = false;
+    setPaintHint();
+    renderTuner();
+  });
+
+  function fitToPaint() {
+    if (!hasPaint || !currentPreviewFrame || !watermarkEngine || !currentBase) return;
+    const { width, height, imageData } = currentPreviewFrame;
+    const fit = fitWatermarkToMask(imageData, width, height, watermarkEngine.bg96, paintMask);
+    if (!fit) {
+      setPaintHint('Could not locate the logo in the painted area. Try painting a little more of it.');
+      return;
+    }
+
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    currentSettings.sizeScale = clamp(Math.round((fit.size / currentBase.size) * 100) / 100, 0.5, 2);
+    currentSettings.offsetX = fit.x - currentBase.x;
+    currentSettings.offsetY = fit.y - currentBase.y;
+
+    if (sliderScale) sliderScale.value = currentSettings.sizeScale;
+    if (sliderOffsetX) sliderOffsetX.value = currentSettings.offsetX;
+    if (sliderOffsetY) sliderOffsetY.value = currentSettings.offsetY;
+    imgPresetButtons.forEach(b => b.classList.remove('active'));
+    updateSliderLabels();
+    renderTuner();
+
+    const pct = Math.round(Math.min(1, fit.score) * 100);
+    setPaintHint(
+      fit.score >= 0.1
+        ? `Logo located (${fit.size}px, ${pct}% match). Removal uses this position. Paint again or use the sliders to adjust.`
+        : `Weak match (${pct}%). Check the zoomed preview and adjust the sliders manually.`
+    );
+  }
+
+  refreshPaintUi();
+
   function renderTuner() {
     if (!currentPreviewFrame || !mainCanvas || !watermarkEngine) return;
     const { width, height, imageData } = currentPreviewFrame;
@@ -1359,7 +1724,8 @@ function initImageRemover() {
     offscreen.height = height;
 
     const copy = new ImageData(new Uint8ClampedArray(imageData.data), width, height);
-    const { wm, roi } = cleanFrame(watermarkEngine.bg96, copy, width, height, currentBase, currentSettings);
+    const { wm, roi } = cleanFrame(watermarkEngine.bg96, copy, width, height, currentBase, getCleanOptions());
+    lastRoi = roi;
     offscreen.getContext('2d').putImageData(copy, 0, 0);
 
     const maxW = 360;
@@ -1371,6 +1737,12 @@ function initImageRemover() {
     mctx.strokeStyle = '#6366f1';
     mctx.lineWidth = 2;
     mctx.strokeRect(wm.x * scale, wm.y * scale, wm.width * scale, wm.height * scale);
+    if (paintOverlay && paintActive && hasPaint) {
+      mctx.save();
+      mctx.globalAlpha = 0.45;
+      mctx.drawImage(paintOverlay, 0, 0, mainCanvas.width, mainCanvas.height);
+      mctx.restore();
+    }
 
     if (zoomCanvas && currentOriginalBitmap) {
       const zctx = zoomCanvas.getContext('2d');
@@ -1382,6 +1754,13 @@ function initImageRemover() {
       zctx.strokeStyle = '#2563eb';
       zctx.lineWidth = 2;
       zctx.strokeRect((wm.x - roi.x) * sx, (wm.y - roi.y) * sy, wm.width * sx, wm.height * sy);
+      if (paintOverlay && paintActive && hasPaint) {
+        zctx.save();
+        zctx.globalAlpha = 0.45;
+        zctx.imageSmoothingEnabled = false;
+        zctx.drawImage(paintOverlay, roi.x, roi.y, roi.width, roi.height, 0, 0, zoomCanvas.width, zoomCanvas.height);
+        zctx.restore();
+      }
     }
 
     if (zoomCleanedCanvas) {
@@ -1445,9 +1824,6 @@ function initImageRemover() {
   btnAutoDetect?.addEventListener('click', async () => {
     if (!currentFile || !watermarkEngine || !currentPreviewFrame) return;
 
-    // Trigger Monetag Direct Link (formerly on Download button)
-    handleAutoDetectAd();
-
     // Hide staging card
     if (stagingCard) stagingCard.classList.add('hidden');
 
@@ -1459,6 +1835,7 @@ function initImageRemover() {
       // Run Auto-Detection
       currentDetected = detectWatermarkCandidate(currentPreviewFrame.imageData, currentPreviewFrame.width, currentPreviewFrame.height, watermarkEngine.bg96);
 
+      resetPaint();
       tunerContainer.classList.remove('hidden');
       applyAutoSettings();
       smoothScrollTo(tunerContainer);
@@ -1476,6 +1853,7 @@ function initImageRemover() {
     fileInput.value = '';
     currentFile = null;
     currentPreviewFrame = null;
+    resetPaint();
     if (currentOriginalBitmap) {
       currentOriginalBitmap.close();
       currentOriginalBitmap = null;
@@ -1489,18 +1867,13 @@ function initImageRemover() {
   btnExport?.addEventListener('click', async () => {
     if (!currentFile || !watermarkEngine || !currentPreviewFrame) return;
 
-    handleExportAd();
-
-    // Preload Monetag Popunder for the Download button
-    loadMonetagPopunder();
-
     tunerContainer.classList.add('hidden');
     resultsArea.classList.add('hidden');
 
     try {
       const { width, height, imageData } = currentPreviewFrame;
       const copy = new ImageData(new Uint8ClampedArray(imageData.data), width, height);
-      cleanFrame(watermarkEngine.bg96, copy, width, height, currentBase, currentSettings);
+      cleanFrame(watermarkEngine.bg96, copy, width, height, currentBase, getCleanOptions());
 
       const canvas = document.createElement('canvas');
       canvas.width = width;
@@ -1539,7 +1912,6 @@ function initImageRemover() {
               Clean Another
             </button>
           </div>
-          ${getPromoCardHtml('image')}
         </div>
       `;
 
@@ -1994,9 +2366,6 @@ function initVideoRemover() {
   btnAutoDetect?.addEventListener('click', async () => {
     if (!currentFile || !videoEngine || !currentPreviewFrame) return;
 
-    // Trigger Monetag Direct Link (formerly on Download button)
-    handleAutoDetectAd();
-
     // Hide staging card
     if (stagingCard) stagingCard.classList.add('hidden');
 
@@ -2038,11 +2407,6 @@ function initVideoRemover() {
 
   btnExport?.addEventListener('click', async () => {
     if (!currentFile || !videoEngine) return;
-
-    handleExportAd();
-
-    // Preload Monetag Popunder for Download button
-    loadMonetagPopunder();
 
     tunerContainer.classList.add('hidden');
     statusContainer.classList.remove('hidden');
@@ -2087,7 +2451,6 @@ function initVideoRemover() {
               Clean Another Video
             </button>
           </div>
-          ${getPromoCardHtml('video')}
         </div>
       `;
 
@@ -2103,90 +2466,10 @@ function initVideoRemover() {
   });
 }
 
-// ── Results Screen Promo Card Generator ──
-function getPromoCardHtml(type = 'image') {
-  return `
-    <div class="results-promo-banner" data-auto-favicon="https://ishara-madu.github.io/online-image-converter/">
-      <div class="results-promo-badge-row">
-        <span class="results-promo-tag">
-          Recommended Free Tool
-        </span>
-        <span class="badge-featured">100% Free &amp; Fast</span>
-      </div>
-      <div class="results-promo-body">
-        <div class="results-promo-icon-box">
-          <img src="https://ishara-madu.github.io/online-image-converter/favicon.ico"
-            onerror="this.onerror=null; this.src='https://www.google.com/s2/favicons?domain=ishara-madu.github.io&amp;sz=64';"
-            alt="Online Image Converter Favicon"
-            class="tool-favicon-img" width="26" height="26" loading="lazy" />
-        </div>
-        <div class="results-promo-info">
-          <h4 class="results-promo-title">Convert image formats with Online Image Converter</h4>
-          <p class="results-promo-desc">Batch convert your cleaned files to WebP, PNG, JPG, AVIF, or GIF with lossless quality right in your browser.</p>
-        </div>
-        <a href="https://ishara-madu.github.io/online-image-converter/" target="_blank" rel="noopener noreferrer" class="results-promo-btn">
-          <span>Try Image Converter</span>
-          <iconify-icon icon="ph:arrow-square-out-bold" width="16"></iconify-icon>
-        </a>
-      </div>
-    </div>
-  `;
-}
-
-// ── GitHub Star Count Fetcher ──
-async function fetchGitHubStars() {
-  const starCountEl = document.getElementById('star-count-num');
-  if (!starCountEl) return;
-  try {
-    const res = await fetch('https://api.github.com/repos/ishara-madu/gemini-watermark-remover');
-    if (res.ok) {
-      const data = await res.json();
-      if (typeof data.stargazers_count === 'number') {
-        starCountEl.textContent = data.stargazers_count;
-      }
-    }
-  } catch (e) {
-    console.warn('Could not fetch GitHub star count:', e);
-  }
-}
-
 document.addEventListener('DOMContentLoaded', () => {
-  fetchGitHubStars();
   initCustomSelects();
   initMobileMenu();
-  initAutoFavicons();
 });
-fetchGitHubStars();
-
-// ── Automatic Favicon Resolver for Tools ──
-function initAutoFavicons() {
-  document.querySelectorAll('[data-auto-favicon]').forEach((el) => {
-    const targetUrl = el.getAttribute('data-auto-favicon') || el.getAttribute('href');
-    if (!targetUrl) return;
-
-    const img = el.querySelector('.tool-favicon-img');
-    if (!img) return;
-
-    try {
-      const parsedUrl = new URL(targetUrl, window.location.href);
-      const domain = parsedUrl.hostname;
-      const directFavicon = `${parsedUrl.origin}${parsedUrl.pathname.replace(/\/+$/, '')}/assets/favicon-96x96.png`;
-      const fallbackFavicon = `https://www.google.com/s2/favicons?domain=${domain}&sz=64`;
-
-      img.onerror = () => {
-        if (img.src !== fallbackFavicon) {
-          img.src = fallbackFavicon;
-        }
-      };
-
-      if (!img.src || img.src.includes('undefined')) {
-        img.src = directFavicon;
-      }
-    } catch (e) {
-      console.warn('Auto favicon parsing failed:', e);
-    }
-  });
-}
 
 // ── Mobile Hamburger Menu & Navbar Interactions ──
 function initMobileMenu() {
@@ -2218,7 +2501,7 @@ function initMobileMenu() {
     }
   });
 
-  // Close mobile menu when clicking nav links or promo links
+  // Close mobile menu when clicking nav links
   headerActions.querySelectorAll('a').forEach((link) => {
     link.addEventListener('click', () => {
       closeMenu();
@@ -2231,23 +2514,6 @@ function initMobileMenu() {
     }
   });
 
-  // Tools dropdown click toggle (for touch/click accessibility)
-  const toolsDropdown = document.getElementById('tools-dropdown');
-  const toolsBtn = document.getElementById('tools-dropdown-btn');
-  if (toolsDropdown && toolsBtn) {
-    toolsBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const isOpen = toolsDropdown.classList.toggle('open');
-      toolsBtn.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
-    });
-
-    document.addEventListener('click', (e) => {
-      if (!toolsDropdown.contains(e.target)) {
-        toolsDropdown.classList.remove('open');
-        toolsBtn.setAttribute('aria-expanded', 'false');
-      }
-    });
-  }
 }
 
 // ── Custom Select Component Logic ──
