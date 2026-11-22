@@ -10,8 +10,15 @@
 </p>
 
 <p align="center">
+  <a href="https://hey-om7.github.io/gemini-watermark-remover/"><img src="https://img.shields.io/badge/🚀_Live_Demo-GitHub_Pages-6366f1?style=for-the-badge" alt="Live Demo" /></a>
   <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License" />
 </p>
+
+---
+
+## 🌐 Live Website
+
+👉 **Try it online:** [https://hey-om7.github.io/gemini-watermark-remover/](https://hey-om7.github.io/gemini-watermark-remover/)
 
 ---
 
@@ -51,10 +58,10 @@ Run the project locally with any static web server:
 
 ```bash
 # 1. Clone the repository
-git clone <your-repository-url>
+git clone https://github.com/hey-om7/gemini-watermark-remover.git
 
 # 2. Navigate to project folder
-cd <project-folder>
+cd gemini-watermark-remover
 
 # 3. Start a local server (using Python 3, Node, or VS Code Live Server)
 # Option A: Python

@@ -1,2 +1,4 @@
 User-agent: *
 Allow: /
+
+Sitemap: https://hey-om7.github.io/gemini-watermark-remover/sitemap.xml
