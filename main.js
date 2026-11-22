@@ -976,6 +976,381 @@ function fitWatermarkToMask(imageData, width, height, bgImg, mask) {
   return { x: best.x, y: best.y, size: best.size, score: Math.max(0, best.score) };
 }
 
+// ── Heal brush: exemplar-based inpainting (after Criminisi et al., 2004) ──
+// Fills a hole by repeatedly copying the best-matching patch from the known pixels around it.
+// Only a limited margin around the hole is searched, so it uses "a little surrounding area".
+// `hole` is { data, ox, oy, w, h }: a local 0/1 mask whose top-left sits at (ox, oy) in the image.
+// Returns { wx0, wy0, ww, wh, rgb, hole0 } (a local window of filled RGB), or null.
+async function inpaintRegion(imageData, hole, opts = {}) {
+  const W = imageData.width, H = imageData.height, src = imageData.data;
+  // Patch radius 4..6 (9x9 to 13x13 patches): big enough to carry edges, small enough to avoid blocks.
+  const r = opts.patchRadius || Math.max(4, Math.min(6, Math.round(Math.sqrt(hole.w * hole.h) / 6)));
+  const search = opts.searchMargin || Math.max(3 * r + 6, Math.min(100, Math.round(Math.max(hole.w, hole.h) * 0.9)));
+  const wx0 = Math.max(0, hole.ox - search - r);
+  const wy0 = Math.max(0, hole.oy - search - r);
+  const wx1 = Math.min(W - 1, hole.ox + hole.w - 1 + search + r);
+  const wy1 = Math.min(H - 1, hole.oy + hole.h - 1 + search + r);
+  const ww = wx1 - wx0 + 1, wh = wy1 - wy0 + 1, n = ww * wh;
+
+  const rgb = new Uint8ClampedArray(n * 3);
+  const lum = new Float32Array(n);
+  const hole0 = new Uint8Array(n);
+  const filled = new Uint8Array(n);
+  const conf = new Float32Array(n);
+  let remaining = 0;
+  for (let y = 0; y < wh; y++) {
+    for (let x = 0; x < ww; x++) {
+      const i = y * ww + x;
+      const g = ((wy0 + y) * W + (wx0 + x)) * 4;
+      rgb[i * 3] = src[g]; rgb[i * 3 + 1] = src[g + 1]; rgb[i * 3 + 2] = src[g + 2];
+      lum[i] = 0.299 * src[g] + 0.587 * src[g + 1] + 0.114 * src[g + 2];
+      const hx = wx0 + x - hole.ox, hy = wy0 + y - hole.oy;
+      if (hx >= 0 && hy >= 0 && hx < hole.w && hy < hole.h && hole.data[hy * hole.w + hx]) {
+        hole0[i] = 1; remaining++;
+      } else {
+        filled[i] = 1; conf[i] = 1;
+      }
+    }
+  }
+  if (!remaining) return null;
+  const total = remaining;
+  const lx0 = hole.ox - wx0, ly0 = hole.oy - wy0;
+  const lx1 = lx0 + hole.w - 1, ly1 = ly0 + hole.h - 1;
+
+  // Candidate source patch centres: patches that lie fully on original (non-hole) pixels.
+  const sw = ww + 1;
+  const integ = new Int32Array(sw * (wh + 1));
+  for (let y = 0; y < wh; y++) {
+    let row = 0;
+    for (let x = 0; x < ww; x++) {
+      row += hole0[y * ww + x];
+      integ[(y + 1) * sw + x + 1] = integ[y * sw + x + 1] + row;
+    }
+  }
+  const holeIn = (xa, ya, xb, yb) =>
+    integ[(yb + 1) * sw + xb + 1] - integ[ya * sw + xb + 1] - integ[(yb + 1) * sw + xa] + integ[ya * sw + xa];
+  let validCount = 0;
+  for (let cy = r; cy < wh - r; cy++)
+    for (let cx = r; cx < ww - r; cx++)
+      if (holeIn(cx - r, cy - r, cx + r, cy + r) === 0) validCount++;
+  const maxCand = opts.maxCandidates || 5000;
+  const stride = Math.max(1, Math.ceil(Math.sqrt(validCount / maxCand)));
+  const candList = [];
+  for (let cy = r; cy < wh - r; cy += stride)
+    for (let cx = r; cx < ww - r; cx += stride)
+      if (holeIn(cx - r, cy - r, cx + r, cy + r) === 0) candList.push(cy * ww + cx);
+  const cand = Int32Array.from(candList);
+
+  const prio = new Float32Array(n).fill(-1);
+  const pconf = new Float32Array(n);
+
+  const isFront = (x, y, i) =>
+    !filled[i] && ((x > 0 && filled[i - 1]) || (x < ww - 1 && filled[i + 1]) ||
+                   (y > 0 && filled[i - ww]) || (y < wh - 1 && filled[i + ww]));
+
+  const fAt = (x, y) => filled[Math.max(0, Math.min(wh - 1, y)) * ww + Math.max(0, Math.min(ww - 1, x))];
+
+  function priorityAt(x, y, i) {
+    const xa = Math.max(0, x - r), xb = Math.min(ww - 1, x + r);
+    const ya = Math.max(0, y - r), yb = Math.min(wh - 1, y + r);
+    let cs = 0, cnt = 0, bestMag = 0, bgx = 0, bgy = 0;
+    for (let yy = ya; yy <= yb; yy++) {
+      for (let xx = xa; xx <= xb; xx++) {
+        const j = yy * ww + xx;
+        cnt++;
+        if (!filled[j]) continue;
+        cs += conf[j];
+        if (xx > 0 && xx < ww - 1 && yy > 0 && yy < wh - 1 &&
+            filled[j - 1] && filled[j + 1] && filled[j - ww] && filled[j + ww]) {
+          const gx = (lum[j + 1] - lum[j - 1]) * 0.5;
+          const gy = (lum[j + ww] - lum[j - ww]) * 0.5;
+          const m = gx * gx + gy * gy;
+          if (m > bestMag) { bestMag = m; bgx = gx; bgy = gy; }
+        }
+      }
+    }
+    const C = cs / cnt;
+    // Front normal from a Sobel filter over the filled mask.
+    const nx = (fAt(x + 1, y - 1) + 2 * fAt(x + 1, y) + fAt(x + 1, y + 1)) -
+               (fAt(x - 1, y - 1) + 2 * fAt(x - 1, y) + fAt(x - 1, y + 1));
+    const ny = (fAt(x - 1, y + 1) + 2 * fAt(x, y + 1) + fAt(x + 1, y + 1)) -
+               (fAt(x - 1, y - 1) + 2 * fAt(x, y - 1) + fAt(x + 1, y - 1));
+    const nl = Math.hypot(nx, ny);
+    const D = nl > 1e-6 ? Math.abs(-bgy * nx + bgx * ny) / (255 * nl) : 0;
+    pconf[i] = C;
+    return C * (D + 0.001);
+  }
+
+  for (let y = ly0; y <= ly1; y++)
+    for (let x = lx0; x <= lx1; x++) {
+      const i = y * ww + x;
+      if (hole0[i] && isFront(x, y, i)) prio[i] = priorityAt(x, y, i);
+    }
+
+  const tOff = new Int32Array((2 * r + 1) * (2 * r + 1));
+  const tRGB = new Int16Array(tOff.length * 3);
+  let tLast = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  let iter = 0;
+
+  while (remaining > 0 && cand.length) {
+    let bestP = -1, bi = -1;
+    for (let y = ly0; y <= ly1; y++) {
+      const rowOff = y * ww;
+      for (let x = lx0; x <= lx1; x++) {
+        const p = prio[rowOff + x];
+        if (p > bestP) { bestP = p; bi = rowOff + x; }
+      }
+    }
+    if (bi < 0) break;
+    const px = bi % ww, py = (bi / ww) | 0;
+    const Cp = pconf[bi];
+
+    // Known pixels of the target patch
+    let tc = 0;
+    const ya = Math.max(0, py - r), yb = Math.min(wh - 1, py + r);
+    const xa = Math.max(0, px - r), xb = Math.min(ww - 1, px + r);
+    for (let yy = ya; yy <= yb; yy++)
+      for (let xx = xa; xx <= xb; xx++) {
+        const j = yy * ww + xx;
+        if (filled[j]) {
+          tOff[tc] = (yy - py) * ww + (xx - px);
+          tRGB[tc * 3] = rgb[j * 3]; tRGB[tc * 3 + 1] = rgb[j * 3 + 1]; tRGB[tc * 3 + 2] = rgb[j * 3 + 2];
+          tc++;
+        }
+      }
+
+    let bestS = Infinity, bestC = cand[0];
+    const lam = opts.distWeight === undefined ? 0.5 : opts.distWeight;
+    for (let k = 0; k < cand.length; k++) {
+      const c = cand[k];
+      const ddx = (c % ww) - px, ddy = ((c / ww) | 0) - py;
+      let s = lam * (ddx * ddx + ddy * ddy);
+      if (s >= bestS) continue;
+      for (let t = 0; t < tc; t++) {
+        const o = (c + tOff[t]) * 3;
+        const d0 = rgb[o] - tRGB[t * 3];
+        const d1 = rgb[o + 1] - tRGB[t * 3 + 1];
+        const d2 = rgb[o + 2] - tRGB[t * 3 + 2];
+        s += d0 * d0 + d1 * d1 + d2 * d2;
+        if (s >= bestS) break;
+      }
+      if (s < bestS) { bestS = s; bestC = c; }
+    }
+
+    // Copy the unknown pixels of the target patch from the best source patch
+    for (let yy = ya; yy <= yb; yy++)
+      for (let xx = xa; xx <= xb; xx++) {
+        const j = yy * ww + xx;
+        if (filled[j]) continue;
+        const s = (bestC + (yy - py) * ww + (xx - px)) * 3;
+        rgb[j * 3] = rgb[s]; rgb[j * 3 + 1] = rgb[s + 1]; rgb[j * 3 + 2] = rgb[s + 2];
+        lum[j] = 0.299 * rgb[s] + 0.587 * rgb[s + 1] + 0.114 * rgb[s + 2];
+        filled[j] = 1; conf[j] = Cp; prio[j] = -1;
+        remaining--;
+      }
+
+    // Refresh priorities of front pixels whose patches overlap the changed area
+    const ua = Math.max(0, py - 2 * r - 1), ub = Math.min(wh - 1, py + 2 * r + 1);
+    const va = Math.max(0, px - 2 * r - 1), vb = Math.min(ww - 1, px + 2 * r + 1);
+    for (let yy = ua; yy <= ub; yy++)
+      for (let xx = va; xx <= vb; xx++) {
+        const j = yy * ww + xx;
+        if (!hole0[j]) continue;
+        prio[j] = (!filled[j] && isFront(xx, yy, j)) ? priorityAt(xx, yy, j) : -1;
+      }
+
+    iter++;
+    if ((iter & 7) === 0 && now() - tLast > 12) {
+      if (opts.onProgress) opts.onProgress(1 - remaining / total);
+      await new Promise((res) => setTimeout(res, 0));
+      tLast = now();
+    }
+  }
+
+  // Fallback for anything left (no valid source patches, or isolated pixels): diffusion fill
+  let guard = 0;
+  while (remaining > 0 && guard++ < 10000) {
+    const toFill = [];
+    for (let y = ly0; y <= ly1; y++)
+      for (let x = lx0; x <= lx1; x++) {
+        const i = y * ww + x;
+        if (!hole0[i] || filled[i]) continue;
+        let sr = 0, sg = 0, sb = 0, c = 0;
+        for (let dy = -1; dy <= 1; dy++)
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx, yy = y + dy;
+            if (xx < 0 || yy < 0 || xx >= ww || yy >= wh) continue;
+            const j = yy * ww + xx;
+            if (filled[j]) { sr += rgb[j * 3]; sg += rgb[j * 3 + 1]; sb += rgb[j * 3 + 2]; c++; }
+          }
+        if (c) toFill.push([i, sr / c, sg / c, sb / c]);
+      }
+    if (!toFill.length) break;
+    for (const [i, a, b, c] of toFill) {
+      rgb[i * 3] = a; rgb[i * 3 + 1] = b; rgb[i * 3 + 2] = c;
+      filled[i] = 1; remaining--;
+    }
+  }
+  if (remaining > 0) return null;
+  const area = hole.w * hole.h;
+  await voteRefine(rgb, hole0, ww, wh, lx0, ly0, lx1, ly1, {
+    voteRadius: 4,
+    voteIters: area > 150 * 150 ? 2 : area > 80 * 80 ? 3 : 4,
+    yieldFn: async () => {
+      if (now() - tLast > 12) {
+        await new Promise((res) => setTimeout(res, 0));
+        tLast = now();
+      }
+    }
+  });
+  if (opts.onProgress) opts.onProgress(1);
+  return { wx0, wy0, ww, wh, rgb, hole0 };
+}
+
+// Patch-voting refinement (Wexler et al. / PatchMatch). After the greedy fill, every patch that
+// touches the hole is matched again to its nearest known patch, and each hole pixel becomes the
+// average of all matched patches that cover it. This removes block seams but keeps structure.
+async function voteRefine(rgb, hole0, ww, wh, lx0, ly0, lx1, ly1, opts = {}) {
+  const r = opts.voteRadius || 3;
+  const iters = opts.voteIters || 4;
+  const pmIters = opts.pmIters || 3;
+  const yieldFn = opts.yieldFn || null;
+
+  // Source validity: patch of radius r lies fully on original pixels
+  const sw = ww + 1;
+  const integ = new Int32Array(sw * (wh + 1));
+  for (let y = 0; y < wh; y++) {
+    let row = 0;
+    for (let x = 0; x < ww; x++) {
+      row += hole0[y * ww + x];
+      integ[(y + 1) * sw + x + 1] = integ[y * sw + x + 1] + row;
+    }
+  }
+  const holeIn = (xa, ya, xb, yb) =>
+    integ[(yb + 1) * sw + xb + 1] - integ[ya * sw + xb + 1] - integ[(yb + 1) * sw + xa] + integ[ya * sw + xa];
+  const validSrc = (cx, cy) =>
+    cx >= r && cy >= r && cx < ww - r && cy < wh - r && holeIn(cx - r, cy - r, cx + r, cy + r) === 0;
+  const validList = [];
+  for (let cy = r; cy < wh - r; cy++)
+    for (let cx = r; cx < ww - r; cx++) if (validSrc(cx, cy)) validList.push(cy * ww + cx);
+  if (!validList.length) return;
+
+  // Target patches: centres whose patch overlaps the hole (clamped so the patch fits in the window)
+  const tx0 = Math.max(r, lx0 - r), ty0 = Math.max(r, ly0 - r);
+  const tx1 = Math.min(ww - 1 - r, lx1 + r), ty1 = Math.min(wh - 1 - r, ly1 + r);
+  const targets = [];
+  for (let cy = ty0; cy <= ty1; cy++)
+    for (let cx = tx0; cx <= tx1; cx++)
+      if (holeIn(cx - r, cy - r, cx + r, cy + r) > 0) targets.push(cy * ww + cx);
+  if (!targets.length) return;
+  const T = targets.length;
+
+  let seed = 12345;
+  const rand = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+
+  const dist = (t, s, best) => {
+    let d = 0;
+    for (let dy = -r; dy <= r; dy++) {
+      const ot = (t + dy * ww) * 3, os = (s + dy * ww) * 3;
+      for (let dx = -r * 3; dx <= r * 3; dx += 3) {
+        const a = rgb[ot + dx] - rgb[os + dx];
+        const b = rgb[ot + dx + 1] - rgb[os + dx + 1];
+        const c = rgb[ot + dx + 2] - rgb[os + dx + 2];
+        d += a * a + b * b + c * c;
+        if (d >= best) return d;
+      }
+    }
+    return d;
+  };
+
+  // Map target centre -> index for propagation lookups
+  const tIndex = new Int32Array(ww * wh).fill(-1);
+  for (let i = 0; i < T; i++) tIndex[targets[i]] = i;
+
+  const nnf = new Int32Array(T);
+  const nnd = new Float64Array(T);
+  for (let i = 0; i < T; i++) {
+    const t = targets[i];
+    // Init: the target itself if it is a valid source (its known part), else random
+    nnf[i] = validSrc(t % ww, (t / ww) | 0) ? t : validList[(rand() * validList.length) | 0];
+    nnd[i] = dist(t, nnf[i], Infinity);
+  }
+
+  const acc = new Float32Array(ww * wh * 3);
+  const wsum = new Float32Array(ww * wh);
+  const maxSpan = Math.max(ww, wh);
+
+  for (let it = 0; it < iters; it++) {
+    // Re-score with current pixels
+    for (let i = 0; i < T; i++) nnd[i] = dist(targets[i], nnf[i], Infinity);
+
+    for (let pm = 0; pm < pmIters; pm++) {
+      const fwd = (pm & 1) === 0;
+      for (let k = 0; k < T; k++) {
+        const i = fwd ? k : T - 1 - k;
+        const t = targets[i];
+        const tx = t % ww, ty = (t / ww) | 0;
+        const step = fwd ? -1 : 1;
+        // Propagation from left/right and up/down neighbours
+        for (const [nx, ny] of [[tx + step, ty], [tx, ty + step]]) {
+          if (nx < 0 || ny < 0 || nx >= ww || ny >= wh) continue;
+          const j = tIndex[ny * ww + nx];
+          if (j < 0) continue;
+          const s = nnf[j];
+          const cx = (s % ww) - (nx - tx), cy = ((s / ww) | 0) - (ny - ty);
+          if (!validSrc(cx, cy)) continue;
+          const c = cy * ww + cx;
+          const d = dist(t, c, nnd[i]);
+          if (d < nnd[i]) { nnd[i] = d; nnf[i] = c; }
+        }
+        // Random search around the current match
+        let rad = maxSpan;
+        const bx = nnf[i] % ww, by = (nnf[i] / ww) | 0;
+        while (rad >= 1) {
+          const cx = Math.round(bx + (rand() * 2 - 1) * rad);
+          const cy = Math.round(by + (rand() * 2 - 1) * rad);
+          if (validSrc(cx, cy)) {
+            const c = cy * ww + cx;
+            const d = dist(t, c, nnd[i]);
+            if (d < nnd[i]) { nnd[i] = d; nnf[i] = c; }
+          }
+          rad >>= 1;
+        }
+      }
+      if (yieldFn) await yieldFn();
+    }
+
+    // Voting
+    acc.fill(0);
+    wsum.fill(0);
+    for (let i = 0; i < T; i++) {
+      const t = targets[i], s = nnf[i];
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+          const p = t + dy * ww + dx;
+          if (!hole0[p]) continue;
+          const q = s + dy * ww + dx;
+          acc[p * 3] += rgb[q * 3];
+          acc[p * 3 + 1] += rgb[q * 3 + 1];
+          acc[p * 3 + 2] += rgb[q * 3 + 2];
+          wsum[p] += 1;
+        }
+      }
+    }
+    for (let y = ly0; y <= ly1; y++) {
+      for (let x = lx0; x <= lx1; x++) {
+        const p = y * ww + x;
+        if (!hole0[p] || !wsum[p]) continue;
+        rgb[p * 3] = acc[p * 3] / wsum[p];
+        rgb[p * 3 + 1] = acc[p * 3 + 1] / wsum[p];
+        rgb[p * 3 + 2] = acc[p * 3 + 2] / wsum[p];
+      }
+    }
+    if (yieldFn) await yieldFn();
+  }
+}
+
 function detectVideoWatermarkCandidate(imageData, width, height, bgImg) {
   const baseDim = Math.min(width, height);
   const veoBase = {
@@ -1546,6 +1921,7 @@ function initImageRemover() {
     setPaintHint();
     refreshPaintUi();
     updateBrushLimits();
+    resetHeal();
   }
 
   function recomputeHasPaint() {
@@ -1653,6 +2029,7 @@ function initImageRemover() {
     if (paintActive && !eraseMode) {
       paintActive = false;
     } else {
+      setHealActive(false);
       paintActive = true;
       eraseMode = false;
     }
@@ -1664,6 +2041,7 @@ function initImageRemover() {
     if (paintActive && eraseMode) {
       paintActive = false;
     } else {
+      setHealActive(false);
       paintActive = true;
       eraseMode = true;
     }
@@ -1715,6 +2093,370 @@ function initImageRemover() {
 
   refreshPaintUi();
 
+  // ── Heal brush (spot healing) ──
+  // Paint over an object. On release it is filled in from nearby texture. Heals are stored as a
+  // layer on top of the watermark-cleaned image, so they appear in the preview and the export.
+  const btnHealToggle = document.getElementById('btn-img-heal-toggle');
+  const sliderHealBrush = document.getElementById('slider-img-heal-brush');
+  const lblHealBrush = document.getElementById('lbl-img-heal-brush');
+  const sliderHealZoom = document.getElementById('slider-img-heal-zoom');
+  const lblHealZoom = document.getElementById('lbl-img-heal-zoom');
+  const btnHealUndo = document.getElementById('btn-img-heal-undo');
+  const btnHealReset = document.getElementById('btn-img-heal-reset');
+  const healHint = document.getElementById('img-heal-hint');
+  const healViewport = document.getElementById('img-heal-viewport');
+  const healStack = document.getElementById('img-heal-stack');
+  const healBase = document.getElementById('img-heal-base');
+  const healOverlay = document.getElementById('img-heal-overlay');
+  const healRing = document.getElementById('img-heal-ring');
+  const HEAL_HINT_DEFAULT = healHint ? healHint.textContent.trim() : '';
+  const HEAL_MAX_AREA = 400 * 400;
+  const HEAL_UNDO_LIMIT = 30;
+
+  let healActive = false;
+  let healBusy = false;
+  let healBrush = 20;
+  let healZoom = 100;
+  let healData = null;
+  let healMask = null;
+  let healBounds = null;
+  let healStrokeMask = null;
+  let healStrokeBounds = null;
+  let healDrawing = false;
+  let healLast = null;
+  let healJobId = 0;
+  let lastComposite = null;
+  const healUndo = [];
+
+  function setHealHint(text) {
+    if (healHint) healHint.textContent = text || HEAL_HINT_DEFAULT;
+  }
+
+  function updateHealUi() {
+    btnHealToggle?.classList.toggle('active', healActive);
+    if (btnHealUndo) btnHealUndo.disabled = healBusy || healUndo.length === 0;
+    if (btnHealReset) btnHealReset.disabled = healBusy || !healBounds;
+    healViewport?.classList.toggle('hidden', !healActive);
+    healViewport?.classList.toggle('busy', healBusy);
+  }
+
+  function ensureHealLayers() {
+    if (!currentPreviewFrame) return false;
+    const { width, height } = currentPreviewFrame;
+    if (!healMask || healMask.length !== width * height) {
+      healMask = new Uint8Array(width * height);
+      healData = new Uint8ClampedArray(width * height * 4);
+      healStrokeMask = new Uint8Array(width * height);
+      healBounds = null;
+      healUndo.length = 0;
+    }
+    return true;
+  }
+
+  // Copies healed pixels over a cleaned frame (in place).
+  function applyHealLayer(img) {
+    if (!healMask || !healBounds || healMask.length !== img.width * img.height) return;
+    const { width, data } = img;
+    const b = healBounds;
+    for (let y = b.y0; y <= b.y1; y++) {
+      for (let x = b.x0; x <= b.x1; x++) {
+        const i = y * width + x;
+        if (!healMask[i]) continue;
+        const o = i * 4;
+        data[o] = healData[o];
+        data[o + 1] = healData[o + 1];
+        data[o + 2] = healData[o + 2];
+      }
+    }
+  }
+
+  function updateHealBrushLimits() {
+    if (!sliderHealBrush || !currentPreviewFrame) return;
+    const minDim = Math.min(currentPreviewFrame.width, currentPreviewFrame.height);
+    const max = Math.max(40, Math.round(minDim * 0.15));
+    sliderHealBrush.max = max;
+    healBrush = Math.max(4, Math.min(max, Math.round(minDim * 0.02)));
+    sliderHealBrush.value = healBrush;
+    if (lblHealBrush) lblHealBrush.textContent = `${healBrush}px`;
+  }
+
+  function applyHealZoom() {
+    if (healStack) healStack.style.width = `${healZoom}%`;
+    if (lblHealZoom) lblHealZoom.textContent = `${healZoom}%`;
+    healRing?.classList.add('hidden');
+  }
+
+  function setHealActive(on) {
+    if (on && !currentPreviewFrame) return;
+    healActive = on;
+    if (on) {
+      paintActive = false;
+      eraseMode = false;
+      refreshPaintUi();
+      ensureHealLayers();
+      const { width, height } = currentPreviewFrame;
+      if (healBase.width !== width || healBase.height !== height) {
+        healBase.width = width;
+        healBase.height = height;
+        healOverlay.width = width;
+        healOverlay.height = height;
+      }
+      updateHealBrushLimits();
+      applyHealZoom();
+    } else {
+      healRing?.classList.add('hidden');
+    }
+    updateHealUi();
+    if (on) renderTuner();
+  }
+
+  function resetHeal() {
+    healJobId++;
+    healBusy = false;
+    healDrawing = false;
+    healLast = null;
+    healData = null;
+    healMask = null;
+    healBounds = null;
+    healStrokeMask = null;
+    healStrokeBounds = null;
+    lastComposite = null;
+    healUndo.length = 0;
+    healActive = false;
+    healOverlay?.getContext('2d').clearRect(0, 0, healOverlay.width, healOverlay.height);
+    setHealHint();
+    updateHealUi();
+  }
+
+  function healStamp(x, y) {
+    const { width, height } = currentPreviewFrame;
+    const r = healBrush / 2;
+    const x0 = Math.max(0, Math.floor(x - r));
+    const x1 = Math.min(width - 1, Math.ceil(x + r));
+    const y0 = Math.max(0, Math.floor(y - r));
+    const y1 = Math.min(height - 1, Math.ceil(y + r));
+    const r2 = r * r;
+    for (let py = y0; py <= y1; py++) {
+      const dy = py + 0.5 - y;
+      for (let px = x0; px <= x1; px++) {
+        const dx = px + 0.5 - x;
+        if (dx * dx + dy * dy <= r2) healStrokeMask[py * width + px] = 1;
+      }
+    }
+    if (!healStrokeBounds) {
+      healStrokeBounds = { x0, y0, x1, y1 };
+    } else {
+      healStrokeBounds.x0 = Math.min(healStrokeBounds.x0, x0);
+      healStrokeBounds.y0 = Math.min(healStrokeBounds.y0, y0);
+      healStrokeBounds.x1 = Math.max(healStrokeBounds.x1, x1);
+      healStrokeBounds.y1 = Math.max(healStrokeBounds.y1, y1);
+    }
+    const octx = healOverlay.getContext('2d');
+    octx.fillStyle = '#22c55e';
+    octx.beginPath();
+    octx.arc(x, y, r, 0, Math.PI * 2);
+    octx.fill();
+  }
+
+  function healStrokeTo(x, y) {
+    if (!healLast) {
+      healStamp(x, y);
+    } else {
+      const dx = x - healLast.x;
+      const dy = y - healLast.y;
+      const steps = Math.max(1, Math.ceil(Math.hypot(dx, dy) / Math.max(1, healBrush / 4)));
+      for (let i = 1; i <= steps; i++) {
+        healStamp(healLast.x + (dx * i) / steps, healLast.y + (dy * i) / steps);
+      }
+    }
+    healLast = { x, y };
+  }
+
+  function healPoint(e) {
+    const rect = healOverlay.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    return {
+      x: ((e.clientX - rect.left) * healOverlay.width) / rect.width,
+      y: ((e.clientY - rect.top) * healOverlay.height) / rect.height
+    };
+  }
+
+  function moveHealRing(e) {
+    if (!healRing || !healActive) return;
+    const rect = healOverlay.getBoundingClientRect();
+    if (!rect.width) return;
+    const size = (healBrush * rect.width) / healOverlay.width;
+    healRing.style.width = `${size}px`;
+    healRing.style.height = `${size}px`;
+    healRing.style.left = `${e.clientX - rect.left}px`;
+    healRing.style.top = `${e.clientY - rect.top}px`;
+    healRing.classList.remove('hidden');
+  }
+
+  function clearHealStroke() {
+    if (healStrokeMask && healStrokeBounds) {
+      const { width } = currentPreviewFrame;
+      const b = healStrokeBounds;
+      for (let y = b.y0; y <= b.y1; y++) {
+        healStrokeMask.fill(0, y * width + b.x0, y * width + b.x1 + 1);
+      }
+    }
+    healStrokeBounds = null;
+    healOverlay?.getContext('2d').clearRect(0, 0, healOverlay.width, healOverlay.height);
+  }
+
+  async function runHeal() {
+    if (!healStrokeBounds || !currentPreviewFrame) return;
+    const job = ++healJobId;
+    healBusy = true;
+    updateHealUi();
+    setHealHint('Healing...');
+    try {
+      renderTuner(); // makes sure lastComposite matches what is on screen
+      const { width, height } = currentPreviewFrame;
+      const margin = Math.max(1, Math.round(healBrush * 0.12));
+      const b = healStrokeBounds;
+      const bounds = { x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1, w: b.x1 - b.x0 + 1, h: b.y1 - b.y0 + 1 };
+      const region = dilateMaskLocal(healStrokeMask, width, height, bounds, margin);
+
+      if (region.w * region.h > HEAL_MAX_AREA) {
+        setHealHint('That area is too large to heal in one go. Paint it in smaller pieces.');
+        clearHealStroke();
+        return;
+      }
+
+      const res = await inpaintRegion(lastComposite, region, {
+        onProgress: (p) => { if (job === healJobId) setHealHint(`Healing... ${Math.round(p * 100)}%`); }
+      });
+      if (job !== healJobId) return; // image was changed or reset meanwhile
+
+      if (!res) {
+        setHealHint('Could not heal that area. Try painting a smaller area with some background around it.');
+        clearHealStroke();
+        return;
+      }
+
+      // Undo snapshot of the region we are about to change
+      const snap = {
+        x: region.ox, y: region.oy, w: region.w, h: region.h,
+        data: new Uint8ClampedArray(region.w * region.h * 4),
+        mask: new Uint8Array(region.w * region.h),
+        prevBounds: healBounds ? { ...healBounds } : null
+      };
+      for (let y = 0; y < region.h; y++) {
+        const gi = (region.oy + y) * width + region.ox;
+        snap.mask.set(healMask.subarray(gi, gi + region.w), y * region.w);
+        snap.data.set(healData.subarray(gi * 4, (gi + region.w) * 4), y * region.w * 4);
+      }
+      healUndo.push(snap);
+      if (healUndo.length > HEAL_UNDO_LIMIT) healUndo.shift();
+
+      for (let y = 0; y < res.wh; y++) {
+        for (let x = 0; x < res.ww; x++) {
+          const li = y * res.ww + x;
+          if (!res.hole0[li]) continue;
+          const gi = (res.wy0 + y) * width + (res.wx0 + x);
+          healMask[gi] = 1;
+          healData[gi * 4] = res.rgb[li * 3];
+          healData[gi * 4 + 1] = res.rgb[li * 3 + 1];
+          healData[gi * 4 + 2] = res.rgb[li * 3 + 2];
+          healData[gi * 4 + 3] = 255;
+        }
+      }
+      const rb = { x0: region.ox, y0: region.oy, x1: region.ox + region.w - 1, y1: region.oy + region.h - 1 };
+      healBounds = healBounds
+        ? {
+            x0: Math.min(healBounds.x0, rb.x0), y0: Math.min(healBounds.y0, rb.y0),
+            x1: Math.max(healBounds.x1, rb.x1), y1: Math.max(healBounds.y1, rb.y1)
+          }
+        : rb;
+
+      clearHealStroke();
+      setHealHint('Healed. Keep painting to remove more, or Undo heal if it is not right.');
+    } catch (err) {
+      console.error('Heal failed:', err);
+      clearHealStroke();
+      setHealHint('Healing failed: ' + (err.message || err));
+    } finally {
+      if (job === healJobId) {
+        healBusy = false;
+        updateHealUi();
+        renderTuner();
+      }
+    }
+  }
+
+  if (healOverlay) {
+    healOverlay.addEventListener('pointerdown', (e) => {
+      if (!healActive || healBusy || !ensureHealLayers()) return;
+      const pt = healPoint(e);
+      if (!pt) return;
+      e.preventDefault();
+      healOverlay.setPointerCapture?.(e.pointerId);
+      healDrawing = true;
+      healLast = null;
+      healStrokeTo(pt.x, pt.y);
+    });
+    healOverlay.addEventListener('pointermove', (e) => {
+      moveHealRing(e);
+      if (!healDrawing) return;
+      const pt = healPoint(e);
+      if (pt) healStrokeTo(pt.x, pt.y);
+    });
+    const endHeal = (e) => {
+      if (!healDrawing) return;
+      healDrawing = false;
+      healLast = null;
+      healOverlay.releasePointerCapture?.(e.pointerId);
+      runHeal();
+    };
+    healOverlay.addEventListener('pointerup', endHeal);
+    healOverlay.addEventListener('pointercancel', endHeal);
+    healOverlay.addEventListener('pointerleave', () => {
+      if (!healDrawing) healRing?.classList.add('hidden');
+    });
+  }
+
+  btnHealToggle?.addEventListener('click', () => setHealActive(!healActive));
+
+  sliderHealBrush?.addEventListener('input', (e) => {
+    healBrush = parseInt(e.target.value, 10);
+    if (lblHealBrush) lblHealBrush.textContent = `${healBrush}px`;
+  });
+
+  sliderHealZoom?.addEventListener('input', (e) => {
+    healZoom = parseInt(e.target.value, 10);
+    applyHealZoom();
+  });
+
+  btnHealUndo?.addEventListener('click', () => {
+    if (healBusy || !healUndo.length || !currentPreviewFrame) return;
+    const snap = healUndo.pop();
+    const { width } = currentPreviewFrame;
+    for (let y = 0; y < snap.h; y++) {
+      const gi = (snap.y + y) * width + snap.x;
+      healMask.set(snap.mask.subarray(y * snap.w, (y + 1) * snap.w), gi);
+      healData.set(snap.data.subarray(y * snap.w * 4, (y + 1) * snap.w * 4), gi * 4);
+    }
+    healBounds = snap.prevBounds;
+    setHealHint(healUndo.length ? 'Last heal undone.' : 'All heals undone.');
+    updateHealUi();
+    renderTuner();
+  });
+
+  btnHealReset?.addEventListener('click', () => {
+    if (healBusy || !healMask) return;
+    healMask.fill(0);
+    healData.fill(0);
+    healBounds = null;
+    healUndo.length = 0;
+    setHealHint('All heals removed.');
+    updateHealUi();
+    renderTuner();
+  });
+
+  updateHealUi();
+
   function renderTuner() {
     if (!currentPreviewFrame || !mainCanvas || !watermarkEngine) return;
     const { width, height, imageData } = currentPreviewFrame;
@@ -1726,7 +2468,12 @@ function initImageRemover() {
     const copy = new ImageData(new Uint8ClampedArray(imageData.data), width, height);
     const { wm, roi } = cleanFrame(watermarkEngine.bg96, copy, width, height, currentBase, getCleanOptions());
     lastRoi = roi;
+    applyHealLayer(copy);
+    lastComposite = copy;
     offscreen.getContext('2d').putImageData(copy, 0, 0);
+    if (healActive && healBase.width === width && healBase.height === height) {
+      healBase.getContext('2d').putImageData(copy, 0, 0);
+    }
 
     const maxW = 360;
     const scale = Math.min(1, maxW / width);
@@ -1874,6 +2621,7 @@ function initImageRemover() {
       const { width, height, imageData } = currentPreviewFrame;
       const copy = new ImageData(new Uint8ClampedArray(imageData.data), width, height);
       cleanFrame(watermarkEngine.bg96, copy, width, height, currentBase, getCleanOptions());
+      applyHealLayer(copy);
 
       const canvas = document.createElement('canvas');
       canvas.width = width;

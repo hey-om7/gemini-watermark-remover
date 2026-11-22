@@ -1064,6 +1064,59 @@ body {
   color: var(--text-muted);
 }
 
+/* ── Heal Tool ── */
+#img-heal-toolbar {
+  padding-top: 0.75rem;
+  border-top: 1px dashed var(--bg-card-border);
+}
+
+.heal-viewport {
+  margin-top: 0.6rem;
+  max-height: 70vh;
+  overflow: auto;
+  border: 1px solid var(--bg-card-border);
+  border-radius: var(--radius-md);
+  background: rgba(0, 0, 0, 0.04);
+}
+
+.heal-viewport.busy {
+  cursor: progress;
+}
+
+.heal-stack {
+  position: relative;
+  width: 100%;
+  line-height: 0;
+}
+
+.heal-stack canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+#img-heal-overlay {
+  position: absolute;
+  inset: 0;
+  height: 100%;
+  opacity: 0.5;
+  cursor: none;
+  touch-action: none;
+}
+
+.heal-viewport.busy #img-heal-overlay {
+  cursor: progress;
+}
+
+.heal-ring {
+  position: absolute;
+  pointer-events: none;
+  border: 2px solid #ffffff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.65);
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+}
+
 canvas.paint-cursor {
   cursor: crosshair;
   touch-action: none;

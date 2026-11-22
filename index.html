@@ -472,6 +472,40 @@
           </p>
         </div>
 
+        <!-- Heal Tool (spot healing / patch) -->
+        <div class="paint-toolbar" id="img-heal-toolbar">
+          <div class="paint-toolbar-row">
+            <span class="tuner-preset-label">Heal Tool:</span>
+            <button type="button" class="btn-paint-tool" id="btn-img-heal-toggle">
+              <iconify-icon icon="ph:bandaids-bold"></iconify-icon> Heal brush
+            </button>
+            <label class="paint-brush-label">
+              Brush <span id="lbl-img-heal-brush">20px</span>
+              <input type="range" id="slider-img-heal-brush" min="2" max="80" step="1" value="20" />
+            </label>
+            <label class="paint-brush-label">
+              Zoom <span id="lbl-img-heal-zoom">100%</span>
+              <input type="range" id="slider-img-heal-zoom" min="100" max="400" step="25" value="100" />
+            </label>
+            <button type="button" class="btn btn-secondary text-xs" id="btn-img-heal-undo" disabled>
+              <iconify-icon icon="ph:arrow-u-up-left-bold"></iconify-icon> Undo heal
+            </button>
+            <button type="button" class="btn btn-secondary text-xs" id="btn-img-heal-reset" disabled>
+              <iconify-icon icon="ph:arrow-counter-clockwise"></iconify-icon> Reset heals
+            </button>
+          </div>
+          <p class="paint-hint" id="img-heal-hint">
+            Turn on the heal brush and paint over anything you want removed. When you release, the area is filled in from the surrounding texture. Use Zoom for small details and scroll inside the view to move around.
+          </p>
+          <div class="heal-viewport hidden" id="img-heal-viewport">
+            <div class="heal-stack" id="img-heal-stack">
+              <canvas id="img-heal-base"></canvas>
+              <canvas id="img-heal-overlay"></canvas>
+              <div class="heal-ring hidden" id="img-heal-ring"></div>
+            </div>
+          </div>
+        </div>
+
         <!-- Quick Select Model Presets -->
         <div class="tuner-preset-row">
           <span class="tuner-preset-label">Model Preset:</span>
